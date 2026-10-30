@@ -58,6 +58,7 @@ from powercontext.builtin.persistence.supervision import (
     database_utc_now,
 )
 from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.runtime.count_admission import request_count_admissions
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -114,6 +115,7 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    source_count_threshold: int | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -131,6 +133,10 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -648,6 +654,8 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        if binding.source_count_threshold is not None:
+            await self._sweep_count_admissions(state)
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -994,6 +1002,17 @@ class ArtifactProcessingSupervisor:
                     )
                 state.retries.pop(scope, None)
                 state.completed += 1
+                if state.binding.source_count_threshold is not None:
+                    try:
+                        async with self._database.transaction() as connection:
+                            await request_count_admissions(
+                                connection,
+                                binding_name=state.binding.binding_name,
+                                threshold=state.binding.source_count_threshold,
+                                scope_ids=(scope,),
+                            )
+                    except Exception as error:
+                        self._log_failure(state, running.assignment, error, "count_admission")
                 if row.requested_generation > row.handled_generation:
                     self.wake(state.binding.binding_name)
             except (ArtifactProcessingLeadershipLostError, _WorkerTerminationError):
@@ -1097,6 +1116,26 @@ class ArtifactProcessingSupervisor:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
 
+    def wake_count_admission(self) -> None:
+        """Wake only the Families whose count thresholds are configured."""
+
+        for state in self._families.values():
+            if state.binding.source_count_threshold is not None:
+                self.wake(state.binding.binding_name)
+
+    async def _sweep_count_admissions(self, state: _FamilyState) -> None:
+        """Request processing for every dirty scope at or above its count threshold."""
+
+        try:
+            async with self._database.transaction() as connection:
+                await request_count_admissions(
+                    connection,
+                    binding_name=state.binding.binding_name,
+                    threshold=state.binding.source_count_threshold or 0,
+                )
+        except Exception as error:
+            self._log_failure(state, None, error, "count_admission")
+
     def _log_failure(
         self,
         state: _FamilyState | None,
@@ -1191,6 +1230,10 @@ class ArtifactProcessingSupervisors:
     def wake(self, binding_name: str | None = None) -> None:
         for supervisor in self.supervisors:
             supervisor.wake(binding_name)
+
+    def wake_count_admission(self) -> None:
+        for supervisor in self.supervisors:
+            supervisor.wake_count_admission()
 
     async def close(self) -> None:
         await asyncio.gather(*(item.close() for item in self.supervisors))
