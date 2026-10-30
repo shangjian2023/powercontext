@@ -127,6 +127,7 @@ from powercontext.builtin.runtime.artifact_processing import (
     SpawnArtifactProcessingWorkerLauncher,
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
+from powercontext.builtin.runtime.source_lifecycle import LifecycleApplication, lifecycle_aware_topic_search
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -627,7 +628,9 @@ async def open_builtin_runtime(
                 skill_package_uploader=contexts.upload_skill_package,
                 skill_usage_recorder=contexts.record_skill_usage,
                 experience_incubator=contexts.incubate_experience if contexts.experience_incubation else None,
-                topic_memory_search=contexts.search_topic_memories,
+                topic_memory_search=lifecycle_aware_topic_search(
+                    contexts.search_topic_memories, contexts.database
+                ),
                 topic_memory_get=contexts.get_topic_memory,
                 topic_memory_browse=contexts.browse_topic_memories,
                 topic_memory_flush=contexts.request_topic_memory_flush,
@@ -657,6 +660,7 @@ async def open_builtin_runtime(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
         contexts.profiles.operation_context = runtime._operation
+        runtime.lifecycle = LifecycleApplication(runtime, contexts.database)
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
                 contexts.scopes,
